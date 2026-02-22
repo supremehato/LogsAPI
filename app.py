@@ -906,13 +906,15 @@ def ws_upgrade():
 def get_job():
     """Get next job for client (only jobs created after client loaded)"""
     client_id = request.args.get('client_id', 'unknown')
+    since = float(request.args.get('since', 0))
     connect_time = time.time()
     
     with client_lock:
         active_clients.add(client_id)
-        # Only set connection time if not already set (preserve /client_loaded time)
-        # This ensures we use the actual client load time, not HTTP request time
-        if client_id not in client_connection_times:
+        if since > 0:
+            # Always trust the client's reported load time - survives server restarts
+            client_connection_times[client_id] = since
+        elif client_id not in client_connection_times:
             client_connection_times[client_id] = connect_time
     
     job = job_queue_manager.get_job_for_client(
