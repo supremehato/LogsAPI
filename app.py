@@ -96,7 +96,6 @@ class Job:
     retry_delay: int
     created_time: float
     is_priority: bool = False
-    duel_mode: Optional[str] = None  # NEW: "Yes", "No", or None if unknown
     
     def format_value(self) -> str:
         """Format pet value as K/M/B with /s"""
@@ -260,22 +259,6 @@ class PetParser:
         )
     
     @classmethod
-    def parse_duel_mode(cls, fields: list) -> Optional[str]:
-        """Parse duel mode from embed fields. Returns 'Yes', 'No', or None."""
-        for field in fields:
-            field_name = field.get("name", "").lower()
-            if "duel" in field_name:
-                raw = cls.clean_text(field.get("value", ""))
-                # Check inactive BEFORE active to avoid substring match bug
-                if "inactive" in raw.lower() or "❌" in raw:
-                    return "No"
-                elif "✅" in raw or raw.lower() == "active":
-                    return "Yes"
-                else:
-                    return "No"
-        return None
-
-    @classmethod
     def parse_embed(cls, embed_dict: dict) -> Dict:
         """Parse embed from Gateway JSON format - returns ALL pets found (priority and non-priority) as separate entries"""
         server_id = None
@@ -306,9 +289,6 @@ class PetParser:
                     server_id = match.group()
                     break
         
-        # NEW: Parse duel mode
-        duel_mode = cls.parse_duel_mode(fields)
-
         # Find ALL pets (both priority and non-priority) - send each as separate job
         all_pets_found: Dict[str, Dict] = {}  # pet_name -> {value, name}
         
@@ -394,8 +374,7 @@ class PetParser:
         
         return {
             "server_id": server_id,
-            "pet_info_list": all_pets_list,  # ALL pets, not just priority
-            "duel_mode": duel_mode  # NEW
+            "pet_info_list": all_pets_list  # ALL pets, not just priority
         }
 
 
@@ -640,14 +619,17 @@ class DiscordBot:
                 
                 result = PetParser.parse_embed(embed_dict)
                 server_id = result["server_id"]
-                pet_info_list = result["pet_info_list"]
-                duel_mode = result["duel_mode"]  # NEW
+                pet_info_list = result["pet_info_list"]  # Changed to list
                 
                 if not server_id or not pet_info_list:
                     continue
                 
                 # Create a separate job for EACH pet found
+                # Example: If server has "Dragon Cannelloni 1B" and "Garama 200M", 
+                # we create 2 separate jobs with SAME server_id: "server123" for both
                 for pet_info in pet_info_list:
+                    # Use server_id + pet_name as unique identifier for tracking processed combinations
+                    # But keep the original server_id in the Job so client knows it's the same game
                     unique_tracking_id = f"{server_id}_{pet_info.name}"
                     
                     # Skip if this specific pet+server combo was already processed
@@ -655,16 +637,16 @@ class DiscordBot:
                         continue
                     
                     # Create and add job for this pet
+                    # IMPORTANT: Use original server_id (not unique_tracking_id) so client knows it's same game
                     job = Job(
-                        server_id=server_id,
+                        server_id=server_id,  # Keep original server_id - same for all pets from this server
                         pet_name=pet_info.name,
                         pet_value=pet_info.value,
                         pet_thumbnail=pet_info.thumbnail,
                         retries=Config.DEFAULT_RETRIES,
                         retry_delay=Config.DEFAULT_RETRY_DELAY,
                         created_time=time.time(),
-                        is_priority=pet_info.is_priority,
-                        duel_mode=duel_mode  # NEW
+                        is_priority=pet_info.is_priority
                     )
                     
                     if self.job_queue.add_job(job, unique_tracking_id=unique_tracking_id):
@@ -1130,9 +1112,15 @@ def broadcast_job_to_ws_clients(job: Job):
     }
     
     # Filter: Only send to clients who loaded BEFORE this job was created
+    # This ensures clients don't receive old logs from before they loaded
+    # If job was created at time 200 and client loaded at time 100, send it (client loaded before job)
+    # If job was created at time 100 and client loaded at time 200, skip it (job is older than client load)
     with client_lock:
         eligible_clients = []
         for client_id, load_time in client_connection_times.items():
+            # Only send if client loaded BEFORE job was created (load_time < job.created_time)
+            # This means the client was already loaded when the job was created
+            # If client hasn't loaded yet (load_time = 0), skip it
             if load_time > 0 and load_time < job.created_time:
                 eligible_clients.append(client_id)
         
@@ -1141,6 +1129,7 @@ def broadcast_job_to_ws_clients(job: Job):
             return
     
     # Send to eligible clients only (not broadcast=True, send individually)
+    # For SocketIO, we need to track which session IDs belong to which client IDs
     with ws_clients_lock:
         sent_count = 0
         for client_id in eligible_clients:
@@ -1167,6 +1156,9 @@ def broadcast_job_to_ws_clients(job: Job):
     logger.info(f"📤 Broadcasted job to {sent_count} eligible WS clients (/ws) + {jobs_sent_count} (/jobs): {job.pet_name} (created: {job.created_time:.2f})")
 
 
+# Removed _async_broadcast_job - using SocketIO broadcast instead
+
+
 def run_websocket_server():
     """Run raw WebSocket server integrated with Flask (same port)"""
     global ws_event_loop
@@ -1175,7 +1167,12 @@ def run_websocket_server():
     ws_event_loop = asyncio.new_event_loop()
     
     async def ws_server():
+        # Use same port as Flask - Railway handles WebSocket upgrades
+        # We'll integrate this with Flask using a different approach
+        # For now, we'll use Flask-SocketIO which Railway supports
         logger.info(f"🔌 WebSocket support via Flask-SocketIO on port {Config.PORT}")
+        # The actual WebSocket handling is done through Flask-SocketIO
+        # Raw WebSocket clients can connect to the SocketIO endpoint
     
     # Run in background thread
     def run_loop():
@@ -1195,6 +1192,7 @@ discord_bot: Optional[DiscordBot] = None
 
 def run_flask():
     """Run Flask server with SocketIO"""
+    # Use gevent for better WebSocket support on Railway
     socketio.run(
         app,
         host='0.0.0.0',
